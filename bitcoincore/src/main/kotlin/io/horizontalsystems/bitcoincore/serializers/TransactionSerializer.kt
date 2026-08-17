@@ -19,15 +19,17 @@ object TransactionSerializer {
         val outputs = mutableListOf<TransactionOutput>()
 
         transaction.version = input.readInt()
-        input.mark()
-        val marker = 0xff and input.readUnsignedByte()
-        val inputCount = if (marker == 0) {  // segwit marker: 0x00
-            input.read()  // skip segwit flag: 0x01
-            transaction.segwit = true
-            input.readVarInt()
+        var flags = 0
+        val initialInputCount = input.readVarInt()
+        val inputCount = if (initialInputCount == 0L) {
+            // Match Core's UnserializeTransaction ambiguity exactly: an empty
+            // vin is followed by optional-data flags. A zero flag describes an
+            // empty legacy transaction; a nonzero flag is followed by the real
+            // vin and vout vectors.
+            flags = input.readUnsignedByte()
+            if (flags == 0) 0 else input.readVarInt()
         } else {
-            input.reset()
-            input.readVarInt()
+            initialInputCount
         }
 
         //  inputs
@@ -36,16 +38,23 @@ object TransactionSerializer {
         }
 
         //  outputs
-        val outputCount = input.readVarInt()
-        for (i in 0 until outputCount) {
-            outputs.add(OutputSerializer.deserialize(input, i))
+        if (initialInputCount != 0L || flags != 0) {
+            val outputCount = input.readVarInt()
+            for (i in 0 until outputCount) {
+                outputs.add(OutputSerializer.deserialize(input, i))
+            }
         }
 
         //  extract witness data
-        if (transaction.segwit) {
+        if (flags and 1 != 0) {
+            flags = flags xor 1
             inputs.forEach {
                 it.witness = InputSerializer.deserializeWitness(input)
             }
+            transaction.segwit = inputs.any { it.witness.isNotEmpty() }
+        }
+        if (flags != 0) {
+            throw IllegalArgumentException("Unknown transaction optional data")
         }
 
         transaction.lockTime = input.readUnsignedInt()

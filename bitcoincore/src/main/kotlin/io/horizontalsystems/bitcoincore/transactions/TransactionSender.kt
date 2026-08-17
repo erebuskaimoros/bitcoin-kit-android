@@ -24,7 +24,8 @@ class TransactionSender(
     private val sendType: BitcoinCore.SendType,
     private val transactionSerializer: TransactionSerializer,
     private val maxRetriesCount: Int = 3,
-    private val retriesPeriod: Int = 60
+    private val retriesPeriod: Int = 60,
+    private val broadcastFailurePolicy: BroadcastFailurePolicy = BroadcastFailurePolicy.InvalidateAfterRetries,
 ) : IPeerTaskHandler, TransactionSendTimer.Listener {
 
     fun sendPendingTransactions() {
@@ -38,6 +39,8 @@ class TransactionSender(
             val transactionsToSend = getTransactionsToSend(transactions)
             if (transactionsToSend.isNotEmpty()) {
                 send(transactionsToSend)
+            } else if (transactions.all(::hasExhaustedRetries)) {
+                timer.stop()
             }
 
         } catch (e: PeerGroup.Error) {
@@ -66,6 +69,11 @@ class TransactionSender(
             } ?: true
         }
     }
+
+    private fun hasExhaustedRetries(transaction: FullTransaction): Boolean =
+        storage.getSentTransaction(transaction.header.hash)?.retriesCount?.let { retriesCount ->
+            retriesCount >= maxRetriesCount
+        } ?: false
 
     private fun getPeersToSend(): List<Peer> {
         if (peerManager.peersCount < minConnectedPeerSize) {
@@ -101,14 +109,40 @@ class TransactionSender(
     }
 
     private fun sendViaAPI(transactions: List<FullTransaction>, blockchairApi: BlockchairApi) {
+        if (broadcastFailurePolicy == BroadcastFailurePolicy.InvalidateAfterRetries) {
+            // Preserve the historical API behavior for existing kits. They did
+            // not persist API attempts: any exception invalidated immediately.
+            transactions.forEach { transaction ->
+                try {
+                    val hex = transactionSerializer.serialize(transaction).toHexString()
+                    blockchairApi.broadcastTransaction(hex)
+                    transactionSyncer.handleRelayed(listOf(transaction))
+                } catch (error: Throwable) {
+                    transactionSyncer.handleInvalid(transaction)
+                }
+            }
+            return
+        }
+
+        timer.startIfNotRunning()
         transactions.forEach { transaction ->
+            val sentTransaction = transactionSendStart(transaction)
             try {
                 val hex = transactionSerializer.serialize(transaction).toHexString()
                 blockchairApi.broadcastTransaction(hex)
 
                 transactionSyncer.handleRelayed(listOf(transaction))
+                storage.deleteSentTransaction(sentTransaction)
             } catch (error: Throwable) {
-                transactionSyncer.handleInvalid(transaction)
+                // A transport failure is ambiguous: the server may have accepted
+                // the transaction before the response was lost. Invalidating it
+                // would unlock the inputs and permit an accidental conflicting
+                // spend. Keep the exact raw transaction pending and retry it a
+                // bounded number of times; chain/API sync can later confirm it.
+                sentTransaction.retriesCount++
+                sentTransaction.sendSuccess = false
+                sentTransaction.lastSendTime = System.currentTimeMillis()
+                handleAmbiguousFailure(transaction, sentTransaction)
             }
         }
     }
@@ -130,20 +164,21 @@ class TransactionSender(
         }
     }
 
-    private fun transactionSendStart(transaction: FullTransaction) {
+    private fun transactionSendStart(transaction: FullTransaction): SentTransaction {
         val sentTransaction = storage.getSentTransaction(transaction.header.hash)
 
-        if (sentTransaction == null) {
-            storage.addSentTransaction(SentTransaction(transaction.header.hash))
+        return if (sentTransaction == null) {
+            SentTransaction(transaction.header.hash).also(storage::addSentTransaction)
         } else {
             sentTransaction.lastSendTime = System.currentTimeMillis()
             sentTransaction.sendSuccess = false
             storage.updateSentTransaction(sentTransaction)
+            sentTransaction
         }
     }
 
     @Synchronized
-    private fun transactionSendSuccess(transaction: FullTransaction) {
+    private fun transactionSendAttemptFinished(transaction: FullTransaction) {
         val sentTransaction = storage.getSentTransaction(transaction.header.hash)
 
         if (sentTransaction == null || sentTransaction.sendSuccess) {
@@ -152,8 +187,23 @@ class TransactionSender(
 
         sentTransaction.retriesCount++
         sentTransaction.sendSuccess = true
+        // SendTransactionTask completes both when a peer asks for the raw
+        // transaction and when its request timer expires. Neither outcome proves
+        // rejection: another peer may already have accepted and propagated the
+        // transaction. Keep its inputs locked and retain the exact transaction
+        // after the bounded broadcast attempts; chain sync is the authority that
+        // can later confirm or invalidate it.
+        handleAmbiguousFailure(transaction, sentTransaction)
+    }
 
-        if (sentTransaction.retriesCount >= maxRetriesCount) {
+    private fun handleAmbiguousFailure(
+        transaction: FullTransaction,
+        sentTransaction: SentTransaction,
+    ) {
+        if (
+            sentTransaction.retriesCount >= maxRetriesCount &&
+            broadcastFailurePolicy == BroadcastFailurePolicy.InvalidateAfterRetries
+        ) {
             transactionSyncer.handleInvalid(transaction)
             storage.deleteSentTransaction(sentTransaction)
         } else {
@@ -166,7 +216,7 @@ class TransactionSender(
     override fun handleCompletedTask(peer: Peer, task: PeerTask): Boolean {
         return when (task) {
             is SendTransactionTask -> {
-                transactionSendSuccess(task.transaction)
+                transactionSendAttemptFinished(task.transaction)
                 true
             }
 

@@ -13,7 +13,9 @@ class Peer(
         private val listener: Listener,
         networkMessageParser: NetworkMessageParser,
         networkMessageSerializer: NetworkMessageSerializer,
-        executorService: ExecutorService)
+        executorService: ExecutorService,
+        minimumVerifiedBlockHeight: Int = 0,
+)
     : PeerConnection.Listener, PeerTask.Listener, PeerTask.Requester {
 
     interface Listener {
@@ -36,6 +38,7 @@ class Peer(
     private var connectStartTime: Long? = null
     private val peerConnection = PeerConnection(host, network, this, executorService, networkMessageParser, networkMessageSerializer)
     private val timer = PeerTimer()
+    private val verifiedSyncHeightPolicy = VerifiedSyncHeightPolicy(minimumVerifiedBlockHeight)
 
     val ready: Boolean
         get() = connected && tasks.isEmpty()
@@ -152,7 +155,11 @@ class Peer(
     private fun validatePeerVersion(message: VersionMessage) {
         when {
             message.lastBlock <= 0 -> throw Error.UnsuitablePeerVersion("Peer last block is not greater than 0.")
-            message.lastBlock < localBestBlockHeight -> throw Error.UnsuitablePeerVersion("Peer has expired blockchain ${message.lastBlock} vs ${localBestBlockHeight}(local)")
+            !verifiedSyncHeightPolicy.acceptsPeerHeight(message.lastBlock, localBestBlockHeight) ->
+                throw Error.UnsuitablePeerVersion(
+                    "Peer has expired blockchain ${message.lastBlock} vs " +
+                        "${maxOf(localBestBlockHeight, verifiedSyncHeightPolicy.minimumVerifiedBlockHeight)}(required)"
+                )
             !message.hasBlockChain(network) -> throw Error.UnsuitablePeerVersion("Peer does not have a copy of the block chain.")
             !message.supportsBloomFilter(network) -> throw Error.UnsuitablePeerVersion("Peer does not support Bloom Filter.")
             message.protocolVersion < network.protocolVersion -> throw Error.UnsuitablePeerVersion("Peer protocol version ${message.protocolVersion} vs ${network.protocolVersion}(local)")

@@ -9,7 +9,11 @@ import io.horizontalsystems.bitcoincore.transactions.scripts.ScriptType
  * @param sizeCalculator
  *
  */
-class DustCalculator(dustRelayTxFee: Int, val sizeCalculator: TransactionSizeCalculator) {
+class DustCalculator(
+    dustRelayTxFee: Int,
+    val sizeCalculator: TransactionSizeCalculator,
+    private val fixedDustThreshold: Int? = null,
+) {
     val minFeeRate = dustRelayTxFee / 1000
 
     /**
@@ -17,6 +21,7 @@ class DustCalculator(dustRelayTxFee: Int, val sizeCalculator: TransactionSizeCal
      *@return The minimum amount of satoshis required to make a transaction.
      */
     fun dust(type: ScriptType): Int {
+        fixedDustThreshold?.let { return it }
         // https://github.com/bitcoin/bitcoin/blob/c536dfbcb00fb15963bf5d507b7017c241718bf6/src/policy/policy.cpp#L18
 
         var size = sizeCalculator.outputSize(type)

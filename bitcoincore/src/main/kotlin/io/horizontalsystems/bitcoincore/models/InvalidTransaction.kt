@@ -15,6 +15,7 @@ class InvalidTransaction() : Transaction() {
         order = transaction.order
         isMine = transaction.isMine
         isOutgoing = transaction.isOutgoing
+        isCoinbase = transaction.isCoinbase
         segwit = transaction.segwit
         status = Status.INVALID
         conflictingTxHash = transaction.conflictingTxHash

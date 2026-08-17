@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
  */
 public class BitcoinInput implements AutoCloseable {
 
+    public static final long MAX_COMPACT_SIZE = 0x02000000L;
     private static byte[] EMPTY_BYTES = new byte[0];
     protected final InputStream in;
     private byte[] bufferOf8bytes = new byte[8];
@@ -28,6 +29,14 @@ public class BitcoinInput implements AutoCloseable {
      * @throws IOException
      */
     public long readVarInt() throws IOException {
+        return readVarInt(true);
+    }
+
+    /**
+     * Reads Core's CompactSize encoding, rejecting non-minimal encodings before
+     * callers can allocate vectors or reserialize a different byte sequence.
+     */
+    public long readVarInt(boolean rangeCheck) throws IOException {
         byte[] buffer = new byte[1];
         if (in.read(buffer) < 0) {
             throw new EOFException();
@@ -42,12 +51,31 @@ public class BitcoinInput implements AutoCloseable {
             if ((ch1 | ch2) < 0) {
                 throw new EOFException();
             }
-            return (ch2 << 8) + (ch1 << 0);
+            long value = (ch2 << 8) + (ch1 << 0);
+            if (value < 0xfdL) {
+                throw new IOException("non-canonical CompactSize");
+            }
+            return checkedCompactSize(value, rangeCheck);
         }
         if (ch == 0xfe) {
-            return readInt();
+            long value = readUnsignedInt();
+            if (value < 0x10000L) {
+                throw new IOException("non-canonical CompactSize");
+            }
+            return checkedCompactSize(value, rangeCheck);
         }
-        return readLong();
+        long value = readLong();
+        if (value < 0 || value < 0x100000000L) {
+            throw new IOException("non-canonical CompactSize");
+        }
+        return checkedCompactSize(value, rangeCheck);
+    }
+
+    private long checkedCompactSize(long value, boolean rangeCheck) throws IOException {
+        if (rangeCheck && value > MAX_COMPACT_SIZE) {
+            throw new IOException("CompactSize exceeds Core MAX_SIZE");
+        }
+        return value;
     }
 
     /**

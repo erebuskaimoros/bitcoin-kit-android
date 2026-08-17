@@ -10,16 +10,18 @@ import io.horizontalsystems.bitcoincore.storage.UtxoFilters
 class UnspentOutputProvider(
     private val storage: IStorage,
     private val confirmationsThreshold: Int = 6,
-    val pluginManager: PluginManager
+    val pluginManager: PluginManager,
+    private val spendabilityPolicy: UtxoSpendabilityPolicy = AllowAllUtxoSpendabilityPolicy,
 ) : IUnspentOutputProvider {
 
     override fun getSpendableUtxo(filters: UtxoFilters): List<UnspentOutput> {
+        val lastBlockHeight = activeChainHeight()
         return allUtxo().filter {
-            isSpendable(it) && filters.filterUtxo(it, storage)
+            isSpendable(it, lastBlockHeight) && filters.filterUtxo(it, storage)
         }
     }
 
-    private fun isSpendable(utxo: UnspentOutput): Boolean {
+    private fun isSpendable(utxo: UnspentOutput, lastBlockHeight: Int): Boolean {
         if (!pluginManager.isSpendable(utxo)) {
             return false
         }
@@ -28,11 +30,14 @@ class UnspentOutputProvider(
             return false
         }
 
-        return true
+        return spendabilityPolicy.isSpendable(utxo, lastBlockHeight)
     }
 
-    private fun getUnspendableTimeLockedUtxo() = allUtxo().filter {
-        !pluginManager.isSpendable(it)
+    private fun getUnspendableTimeLockedUtxo(): List<UnspentOutput> {
+        val lastBlockHeight = activeChainHeight()
+        return allUtxo().filter {
+            !pluginManager.isSpendable(it) || !spendabilityPolicy.isSpendable(it, lastBlockHeight)
+        }
     }
 
     private fun getUnspendableNotRelayedUtxo() = allUtxo().filter {
@@ -49,7 +54,7 @@ class UnspentOutputProvider(
 
     // Only confirmed spendable outputs
     fun getConfirmedSpendableUtxo(filters: UtxoFilters): List<UnspentOutput> {
-        val lastBlockHeight = storage.lastBlock()?.height ?: 0
+        val lastBlockHeight = activeChainHeight()
 
         return getSpendableUtxo(filters).filter {
             val block = it.block ?: return@filter false
@@ -62,7 +67,7 @@ class UnspentOutputProvider(
 
         if (confirmationsThreshold == 0) return unspentOutputs
 
-        val lastBlockHeight = storage.lastBlock()?.height ?: 0
+        val lastBlockHeight = activeChainHeight()
 
         return unspentOutputs.filter {
             // If a transaction is an outgoing transaction, then it can be used
@@ -81,4 +86,7 @@ class UnspentOutputProvider(
             false
         }
     }
+
+    private fun activeChainHeight(): Int =
+        storage.getBlock(stale = false, sortedHeight = "DESC")?.height ?: 0
 }

@@ -4,6 +4,7 @@ import io.horizontalsystems.bitcoincore.blocks.validators.BlockValidatorExceptio
 import io.horizontalsystems.bitcoincore.blocks.validators.IBlockValidator
 import io.horizontalsystems.bitcoincore.core.IStorage
 import io.horizontalsystems.bitcoincore.extensions.toReversedHex
+import io.horizontalsystems.bitcoincore.extensions.toHexString
 import io.horizontalsystems.bitcoincore.models.Block
 import io.horizontalsystems.bitcoincore.models.MerkleBlock
 import io.horizontalsystems.bitcoincore.storage.BlockHeader
@@ -11,7 +12,8 @@ import io.horizontalsystems.bitcoincore.storage.BlockHeader
 class Blockchain(
     private val storage: IStorage,
     private val blockValidator: IBlockValidator?,
-    private val dataListener: IBlockchainDataListener
+    private val dataListener: IBlockchainDataListener,
+    private val forkChoice: ForkChoice = LongestHeightForkChoice(),
 ) {
 
     fun connect(merkleBlock: MerkleBlock): Block {
@@ -54,21 +56,87 @@ class Blockchain(
     fun handleFork() {
         val firstStaleHeight = storage.getBlock(stale = true, sortedHeight = "ASC")?.height ?: return
 
-        val lastNotStaleHeight = storage.getBlock(stale = false, sortedHeight = "DESC")?.height ?: 0
+        val activeBranch = storage.getBlocks(
+            heightGreaterOrEqualTo = firstStaleHeight,
+            stale = false,
+        ).sortedBy(Block::height)
+        val staleBlocks = storage.getBlocks(stale = true)
+        val candidatePaths = connectedCandidatePaths(staleBlocks, activeBranch.isEmpty())
 
-        if (firstStaleHeight <= lastNotStaleHeight) {
-            val lastStaleHeight = storage.getBlock(stale = true, sortedHeight = "DESC")?.height ?: firstStaleHeight
+        var bestEvaluationBranch = activeBranch
+        var winningPath: List<Block>? = null
 
-            if (lastStaleHeight > lastNotStaleHeight) {
-                val notStaleBlocks = storage.getBlocks(heightGreaterOrEqualTo = firstStaleHeight, stale = false)
-                deleteBlocks(notStaleBlocks)
-                storage.unstaleAllBlocks()
-            } else {
-                val staleBlocks = storage.getBlocks(stale = true)
-                deleteBlocks(staleBlocks)
+        candidatePaths.forEach { path ->
+            // Candidates may split from active at different heights. Include
+            // the still-common active prefix so all comparisons cover the same
+            // post-fork interval; its work then cancels naturally.
+            val evaluationBranch = activeBranch.filter { it.height < path.first().height } + path
+            if (forkChoice.shouldSwitch(bestEvaluationBranch, evaluationBranch)) {
+                bestEvaluationBranch = evaluationBranch
+                winningPath = path
+            }
+        }
+
+        val winner = winningPath
+        if (winner == null) {
+            deleteBlocks(staleBlocks)
+            return
+        }
+
+        deleteBlocks(activeBranch.filter { it.height >= winner.first().height })
+
+        val winningHashes = winner.map { it.headerHash.toHexString() }.toSet()
+        val losingStaleBlocks = staleBlocks.filterNot { it.headerHash.toHexString() in winningHashes }
+        if (losingStaleBlocks.isNotEmpty()) {
+            deleteBlocks(losingStaleBlocks)
+            winner.forEach { block ->
+                block.stale = false
+                storage.updateBlock(block)
             }
         } else {
+            // Preserve the historical fast path for the common single-branch
+            // case while never activating unrelated sibling branches.
             storage.unstaleAllBlocks()
+        }
+    }
+
+    private fun connectedCandidatePaths(
+        staleBlocks: List<Block>,
+        allowMissingRootParent: Boolean,
+    ): List<List<Block>> {
+        if (staleBlocks.isEmpty()) return emptyList()
+
+        val byHash = staleBlocks.associateBy { it.headerHash.toHexString() }
+        val staleParentHashes = staleBlocks.map { it.previousBlockHash.toHexString() }.toSet()
+        val leaves = staleBlocks
+            .filter { it.headerHash.toHexString() !in staleParentHashes }
+            .sortedWith(compareByDescending<Block> { it.height }.thenBy { it.headerHash.toHexString() })
+
+        return leaves.mapNotNull { leaf ->
+            val reversed = mutableListOf<Block>()
+            val visited = mutableSetOf<String>()
+            var cursor: Block? = leaf
+
+            while (cursor != null) {
+                val hash = cursor.headerHash.toHexString()
+                if (!visited.add(hash)) return@mapNotNull null
+                reversed.add(cursor)
+                val parent = byHash[cursor.previousBlockHash.toHexString()]
+                if (parent != null && parent.height + 1 != cursor.height) return@mapNotNull null
+                cursor = parent
+            }
+
+            val path = reversed.asReversed()
+            val root = path.first()
+            val rootParent = storage.getBlock(root.previousBlockHash)
+            if (
+                rootParent == null && !allowMissingRootParent ||
+                rootParent != null && (rootParent.stale || rootParent.height + 1 != root.height)
+            ) {
+                null
+            } else {
+                path
+            }
         }
     }
 

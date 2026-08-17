@@ -2,7 +2,7 @@ package io.horizontalsystems.bitcoincore.network.messages
 
 import io.horizontalsystems.bitcoincore.extensions.toReversedHex
 import io.horizontalsystems.bitcoincore.io.BitcoinInputMarkable
-import io.horizontalsystems.bitcoincore.serializers.BlockHeaderParser
+import io.horizontalsystems.bitcoincore.serializers.IBlockHeaderParser
 import io.horizontalsystems.bitcoincore.storage.BlockHeader
 
 /**
@@ -33,7 +33,7 @@ class MerkleBlockMessage(
     }
 }
 
-class MerkleBlockMessageParser(private val blockHeaderParser: BlockHeaderParser) : IMessageParser {
+class MerkleBlockMessageParser(private val blockHeaderParser: IBlockHeaderParser) : IMessageParser {
     override val command = "merkleblock"
 
     override fun parseMessage(input: BitcoinInputMarkable): IMessage {

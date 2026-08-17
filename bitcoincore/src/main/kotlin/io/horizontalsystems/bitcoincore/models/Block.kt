@@ -2,6 +2,7 @@ package io.horizontalsystems.bitcoincore.models
 
 import androidx.room.ColumnInfo
 import androidx.room.Entity
+import androidx.room.Ignore
 import androidx.room.Index
 import androidx.room.PrimaryKey
 import io.horizontalsystems.bitcoincore.core.IStorage
@@ -38,6 +39,15 @@ class Block() {
     var stale = false
     var partial = false
 
+    @Ignore
+    var proofOfWorkHash: ByteArray = byteArrayOf()
+
+    @Ignore
+    var auxPow = false
+
+    @Ignore
+    var auxPowValidated = false
+
     fun previousBlock(storage: IStorage): Block? {
         return storage.getBlock(hashHash = previousBlockHash)
     }
@@ -52,6 +62,9 @@ class Block() {
         nonce = header.nonce
 
         headerHash = header.hash
+        proofOfWorkHash = header.proofOfWorkHash
+        auxPow = header.auxPow
+        auxPowValidated = header.auxPowValidated
         this.height = height
     }
 }
