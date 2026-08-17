@@ -21,6 +21,8 @@ import io.horizontalsystems.bitcoincore.blocks.Blockchain
 import io.horizontalsystems.bitcoincore.blocks.BloomFilterLoader
 import io.horizontalsystems.bitcoincore.blocks.InitialBlockDownload
 import io.horizontalsystems.bitcoincore.blocks.MerkleBlockExtractor
+import io.horizontalsystems.bitcoincore.blocks.ForkChoice
+import io.horizontalsystems.bitcoincore.blocks.LongestHeightForkChoice
 import io.horizontalsystems.bitcoincore.blocks.validators.IBlockValidator
 import io.horizontalsystems.bitcoincore.core.AccountWallet
 import io.horizontalsystems.bitcoincore.core.BaseTransactionInfoConverter
@@ -55,6 +57,8 @@ import io.horizontalsystems.bitcoincore.managers.UnspentOutputProvider
 import io.horizontalsystems.bitcoincore.managers.UnspentOutputSelector
 import io.horizontalsystems.bitcoincore.managers.UnspentOutputSelectorChain
 import io.horizontalsystems.bitcoincore.managers.UnspentOutputSelectorSingleNoChange
+import io.horizontalsystems.bitcoincore.managers.AllowAllUtxoSpendabilityPolicy
+import io.horizontalsystems.bitcoincore.managers.UtxoSpendabilityPolicy
 import io.horizontalsystems.bitcoincore.models.Checkpoint
 import io.horizontalsystems.bitcoincore.models.WatchAddressPublicKey
 import io.horizontalsystems.bitcoincore.network.Network
@@ -86,8 +90,10 @@ import io.horizontalsystems.bitcoincore.network.peer.PeerGroup
 import io.horizontalsystems.bitcoincore.network.peer.PeerManager
 import io.horizontalsystems.bitcoincore.rbf.ReplacementTransactionBuilder
 import io.horizontalsystems.bitcoincore.serializers.BlockHeaderParser
+import io.horizontalsystems.bitcoincore.serializers.IBlockHeaderParser
 import io.horizontalsystems.bitcoincore.serializers.TransactionSerializer
 import io.horizontalsystems.bitcoincore.transactions.BlockTransactionProcessor
+import io.horizontalsystems.bitcoincore.transactions.BroadcastFailurePolicy
 import io.horizontalsystems.bitcoincore.transactions.PendingTransactionProcessor
 import io.horizontalsystems.bitcoincore.transactions.SendTransactionsOnPeersSynced
 import io.horizontalsystems.bitcoincore.transactions.TransactionConflictsResolver
@@ -133,6 +139,7 @@ class BitcoinCoreBuilder {
     private var storage: IStorage? = null
     private var apiTransactionProvider: IApiTransactionProvider? = null
     private var blockHeaderHasher: IHasher? = null
+    private var blockHeaderParser: IBlockHeaderParser? = null
     private var transactionInfoConverter: ITransactionInfoConverter? = null
     private var blockValidator: IBlockValidator? = null
     private var checkpoint: Checkpoint? = null
@@ -145,6 +152,11 @@ class BitcoinCoreBuilder {
     private val plugins = mutableListOf<IPlugin>()
     private var handleAddrMessage = true
     private var sendType: BitcoinCore.SendType = BitcoinCore.SendType.P2P
+    private var fixedDustThreshold: Int? = null
+    private var forkChoice: ForkChoice = LongestHeightForkChoice()
+    private var utxoSpendabilityPolicy: UtxoSpendabilityPolicy = AllowAllUtxoSpendabilityPolicy
+    private var broadcastFailurePolicy = BroadcastFailurePolicy.InvalidateAfterRetries
+    private var minimumVerifiedBlockHeight = 0
 
     fun setContext(context: Context): BitcoinCoreBuilder {
         this.context = context
@@ -210,6 +222,44 @@ class BitcoinCoreBuilder {
         return this
     }
 
+    /**
+     * Supplies a chain-specific serialized block-header parser.  Dogecoin uses
+     * this for the variable-length CAuxPow payload that follows its base
+     * 80-byte header.  The default remains the Bitcoin 80-byte parser.
+     */
+    fun setBlockHeaderParser(blockHeaderParser: IBlockHeaderParser): BitcoinCoreBuilder {
+        this.blockHeaderParser = blockHeaderParser
+        return this
+    }
+
+    /** Uses a chain-policy fixed dust threshold instead of Bitcoin's size formula. */
+    fun setFixedDustThreshold(fixedDustThreshold: Int): BitcoinCoreBuilder {
+        require(fixedDustThreshold > 0)
+        this.fixedDustThreshold = fixedDustThreshold
+        return this
+    }
+
+    fun setForkChoice(forkChoice: ForkChoice): BitcoinCoreBuilder {
+        this.forkChoice = forkChoice
+        return this
+    }
+
+    fun setUtxoSpendabilityPolicy(policy: UtxoSpendabilityPolicy): BitcoinCoreBuilder {
+        utxoSpendabilityPolicy = policy
+        return this
+    }
+
+    fun setBroadcastFailurePolicy(policy: BroadcastFailurePolicy): BitcoinCoreBuilder {
+        broadcastFailurePolicy = policy
+        return this
+    }
+
+    fun setMinimumVerifiedBlockHeight(height: Int): BitcoinCoreBuilder {
+        require(height >= 0)
+        minimumVerifiedBlockHeight = height
+        return this
+    }
+
     fun setApiTransactionProvider(apiTransactionProvider: IApiTransactionProvider?): BitcoinCoreBuilder {
         this.apiTransactionProvider = apiTransactionProvider
         return this
@@ -266,7 +316,12 @@ class BitcoinCoreBuilder {
 
         transactionInfoConverter.baseConverter = BaseTransactionInfoConverter(pluginManager)
 
-        val unspentOutputProvider = UnspentOutputProvider(storage, confirmationsThreshold, pluginManager)
+        val unspentOutputProvider = UnspentOutputProvider(
+            storage,
+            confirmationsThreshold,
+            pluginManager,
+            utxoSpendabilityPolicy,
+        )
 
         val dataProvider = DataProvider(storage, unspentOutputProvider, transactionInfoConverter)
 
@@ -377,10 +432,10 @@ class BitcoinCoreBuilder {
 
         val peerManager = PeerManager()
 
-        val networkMessageParser = NetworkMessageParser(network.magic)
+        val networkMessageParser = NetworkMessageParser(network.magic, network.maxMessagePayloadSize)
         val networkMessageSerializer = NetworkMessageSerializer(network.magic)
 
-        val blockchain = Blockchain(storage, blockValidator, dataProvider)
+        val blockchain = Blockchain(storage, blockValidator, dataProvider, forkChoice)
         val blockSyncer = BlockSyncer(storage, blockchain, blockTransactionProcessor, publicKeyManager, checkpoint)
 
 
@@ -393,7 +448,8 @@ class BitcoinCoreBuilder {
             networkMessageSerializer,
             connectionManager,
             blockSyncer.localDownloadedBestBlockHeight,
-            handleAddrMessage
+            handleAddrMessage,
+            minimumVerifiedBlockHeight,
         )
         peerHostManager.listener = peerGroup
 
@@ -433,7 +489,12 @@ class BitcoinCoreBuilder {
                     multiAccountPublicKeyFetcher,
                     apiSyncStateManager
                 )
-                initialDownload = InitialBlockDownload(blockSyncer, peerManager, merkleBlockExtractor)
+                initialDownload = InitialBlockDownload(
+                    blockSyncer,
+                    peerManager,
+                    merkleBlockExtractor,
+                    minimumVerifiedBlockHeight,
+                )
             }
         }
 
@@ -459,7 +520,11 @@ class BitcoinCoreBuilder {
             val ecdsaInputSigner = EcdsaInputSigner(privateWallet, network)
             val schnorrInputSigner = SchnorrInputSigner(privateWallet)
             val transactionSizeCalculatorInstance = TransactionSizeCalculator()
-            val dustCalculatorInstance = DustCalculator(network.dustRelayTxFee, transactionSizeCalculatorInstance)
+            val dustCalculatorInstance = DustCalculator(
+                network.dustRelayTxFee,
+                transactionSizeCalculatorInstance,
+                fixedDustThreshold,
+            )
             val recipientSetter = RecipientSetter(addressConverter, pluginManager)
             val outputSetter = OutputSetter(transactionDataSorterFactory)
             val inputSetter = InputSetter(
@@ -489,7 +554,8 @@ class BitcoinCoreBuilder {
                 storage,
                 transactionSendTimer,
                 sendType,
-                TransactionSerializer
+                TransactionSerializer,
+                broadcastFailurePolicy = broadcastFailurePolicy,
             )
 
             dustCalculator = dustCalculatorInstance
@@ -549,7 +615,7 @@ class BitcoinCoreBuilder {
         // this part can be moved to another place
 
         bitcoinCore.addMessageParser(AddrMessageParser())
-            .addMessageParser(MerkleBlockMessageParser(BlockHeaderParser(blockHeaderHasher)))
+            .addMessageParser(MerkleBlockMessageParser(blockHeaderParser ?: BlockHeaderParser(blockHeaderHasher)))
             .addMessageParser(InvMessageParser())
             .addMessageParser(GetDataMessageParser())
             .addMessageParser(PingMessageParser())

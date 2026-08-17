@@ -21,8 +21,15 @@ interface IMessageSerializer {
     fun serialize(message: IMessage): ByteArray?
 }
 
-class NetworkMessageParser(private val magic: Long) {
+class NetworkMessageParser(
+    private val magic: Long,
+    private val maxPayloadLength: Int = 32 * 1024 * 1024,
+) {
     private var messageParsers = hashMapOf<String, IMessageParser>()
+
+    init {
+        require(maxPayloadLength > 0)
+    }
 
     /**
      * Parse stream as message.
@@ -36,6 +43,9 @@ class NetworkMessageParser(private val magic: Long) {
 
         val command = getCommandFrom(input.readBytes(12))
         val payloadLength = input.readInt()
+        if (payloadLength < 0 || payloadLength > maxPayloadLength) {
+            throw BitcoinException("Invalid payload length $payloadLength (max $maxPayloadLength)")
+        }
         val expectedChecksum = ByteArray(4)
         input.readFully(expectedChecksum)
         val payload = ByteArray(payloadLength)

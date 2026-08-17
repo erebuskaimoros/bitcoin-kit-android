@@ -18,6 +18,9 @@ abstract class Network {
     abstract val blockchairChainId: String
 
     abstract val maxBlockSize: Int
+    /** Protocol messages may be larger than a serialized block (for example, `inv`). */
+    open val maxMessagePayloadSize: Int
+        get() = maxMessagePayloadSize(maxBlockSize)
     abstract val dustRelayTxFee: Int
 
     abstract var port: Int
@@ -35,4 +38,8 @@ abstract class Network {
 
     open val sigHashForked: Boolean = false
     open val sigHashValue = Sighash.ALL
+
+    companion object {
+        fun maxMessagePayloadSize(maxBlockSize: Int): Int = maxOf(maxBlockSize, 4_000_000)
+    }
 }

@@ -2,6 +2,7 @@ package io.horizontalsystems.bitcoincore.apisync.blockchair
 
 import com.eclipsesource.json.Json
 import com.eclipsesource.json.JsonObject
+import com.eclipsesource.json.JsonValue
 import io.horizontalsystems.bitcoincore.apisync.model.AddressItem
 import io.horizontalsystems.bitcoincore.apisync.model.BlockHeaderItem
 import io.horizontalsystems.bitcoincore.apisync.model.TransactionItem
@@ -13,10 +14,23 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
+interface BlockchairTransport {
+    fun get(resource: String): JsonValue
+    fun post(resource: String, body: String): JsonValue
+}
+
+private class DefaultBlockchairTransport : BlockchairTransport {
+    private val readManager = ApiManager("https://api.blocksdecoded.com/v1/blockchair")
+    private val broadcastManager = ApiManager("https://api.blockchair.com")
+
+    override fun get(resource: String): JsonValue = readManager.doOkHttpGet(resource)
+    override fun post(resource: String, body: String): JsonValue = broadcastManager.post(resource, body)
+}
+
 class BlockchairApi(
     private val chainId: String,
+    private val transport: BlockchairTransport = DefaultBlockchairTransport(),
 ) {
-    private val apiManager = ApiManager("https://api.blocksdecoded.com/v1/blockchair")
     private val limit = 10000
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
@@ -67,7 +81,7 @@ class BlockchairApi(
     fun lastBlockHeader(): BlockHeaderItem {
         val params = "?limit=0"
         val url = "$chainId/stats"
-        val response = apiManager.doOkHttpGet(url + params).asObject()
+        val response = transport.get(url + params).asObject()
         val data = response.get("data").asObject()
 
         val height = data["best_block_height"].asInt()
@@ -79,58 +93,56 @@ class BlockchairApi(
     }
 
     fun broadcastTransaction(rawTransactionHex: String) {
-        val apiManager = ApiManager("https://api.blockchair.com")
         val url = "$chainId/push/transaction"
 
         val body = JsonObject().apply {
             this["data"] = Json.value(rawTransactionHex)
         }.toString()
 
-        apiManager.post(url, body)
+        transport.post(url, body)
     }
 
     private fun fetchTransactions(
         addresses: List<String>,
         stopHeight: Int? = null,
-        receivedAddressItems: List<AddressItem> = emptyList(),
-        receivedTransactionItems: List<Transaction> = emptyList()
     ): Pair<List<AddressItem>, List<Transaction>> {
         try {
-            val params = "?transaction_details=true&limit=$limit,0&offset=${receivedTransactionItems.size}"
             val url = "$chainId/dashboards/addresses/${addresses.joinToString(separator = ",")}"
-            val response = apiManager.doOkHttpGet(url + params).asObject()
-            val data = response.get("data").asObject()
+            val receivedAddresses = mutableListOf<AddressItem>()
+            val receivedTransactions = mutableListOf<Transaction>()
+            var offset = 0
 
-            val addressItems = data.get("addresses").asObject().map {
-                val address = it.name
-                val script = it.value.asObject().getString("script_hex", "")
-                AddressItem(script, address)
+            while (true) {
+                val params = "?transaction_details=true&limit=$limit,0&offset=$offset"
+                val response = transport.get(url + params).asObject()
+                val data = response.get("data").asObject()
+
+                receivedAddresses += data.get("addresses").asObject().map {
+                    val address = it.name
+                    val script = it.value.asObject().getString("script_hex", "")
+                    AddressItem(script, address)
+                }
+
+                val pageTransactions = data.get("transactions").asArray().map {
+                    val txObject = it.asObject()
+                    Transaction(
+                        hash = txObject["hash"].asString(),
+                        blockId = txObject["block_id"]?.asInt(),
+                        balanceChange = txObject["balance_change"].asLong(),
+                        address = txObject["address"].asString()
+                    )
+                }
+                receivedTransactions += pageTransactions.filter {
+                    it.blockId == null || stopHeight == null || it.blockId > stopHeight
+                }
+
+                // Advance by the unfiltered page size. Using the filtered size
+                // repeats offsets forever when stopHeight removes old rows.
+                offset += pageTransactions.size
+                if (pageTransactions.size < limit) break
             }
 
-            val transactionItems = data.get("transactions").asArray().map {
-                val txObject = it.asObject()
-                Transaction(
-                    hash = txObject["hash"].asString(),
-                    blockId = txObject["block_id"]?.asInt(),
-                    balanceChange = txObject["balance_change"].asLong(),
-                    address = txObject["address"].asString()
-                )
-            }
-
-            val filteredTransactionItems = transactionItems.filter { it.blockId == null || stopHeight == null || it.blockId > stopHeight }
-            val addressesMerged = receivedAddressItems + addressItems
-            val transactionsMerged = receivedTransactionItems + filteredTransactionItems
-
-            return if (filteredTransactionItems.size < limit) {
-                Pair(addressesMerged, transactionsMerged)
-            } else {
-                fetchTransactions(
-                    addresses = addresses,
-                    stopHeight = stopHeight,
-                    receivedAddressItems = addressesMerged,
-                    receivedTransactionItems = transactionsMerged
-                )
-            }
+            return Pair(receivedAddresses, receivedTransactions)
         } catch (http404Exception: ApiManagerException.Http404Exception) {
             return Pair(emptyList(), emptyList())
         }
@@ -148,7 +160,7 @@ class BlockchairApi(
         try {
             val params = "?limit=0"
             val url = "$chainId/dashboards/blocks/${heights.joinToString(separator = ",")}"
-            val response = apiManager.doOkHttpGet(url + params).asObject()
+            val response = transport.get(url + params).asObject()
 
             val map = mutableMapOf<Int, String>()
             val data = response.get("data").asObject()

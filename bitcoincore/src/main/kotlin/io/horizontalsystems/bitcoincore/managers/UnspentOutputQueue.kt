@@ -59,7 +59,7 @@ class UnspentOutputQueue(
         val changeFee = sizeCalculator.outputSize(changeType) * parameters.fee
         val actualRemainder = remainder - changeFee
 
-        return if (actualRemainder <= recipientOutputDust) {
+        return if (actualRemainder < recipientOutputDust) {
             SelectedUnspentOutputInfo(selectedOutputs, receiveValue, null)
         } else {
             SelectedUnspentOutputInfo(selectedOutputs, receiveValue, actualRemainder)

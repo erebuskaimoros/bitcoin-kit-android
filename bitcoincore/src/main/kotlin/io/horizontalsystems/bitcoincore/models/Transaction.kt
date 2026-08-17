@@ -2,6 +2,7 @@ package io.horizontalsystems.bitcoincore.models
 
 import androidx.room.Entity
 import androidx.room.ForeignKey
+import androidx.room.ColumnInfo
 import java.util.*
 
 /**
@@ -40,6 +41,8 @@ open class Transaction() {
     var order: Int = 0 // topological order
     var isMine = false
     var isOutgoing = false
+    @ColumnInfo(defaultValue = "0")
+    var isCoinbase = false
     var segwit = false
     var status: Int = Status.RELAYED
     var serializedTxInfo: String = ""

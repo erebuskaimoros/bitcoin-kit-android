@@ -20,7 +20,17 @@ class BlockHeader(
         val timestamp: Long,
         val bits: Long,
         val nonce: Long,
-        val hash: ByteArray)
+        val hash: ByteArray,
+        /**
+         * The proof hash can differ from [hash] for merged-mined chains.  It is
+         * deliberately in-memory metadata: a block is validated before it is
+         * persisted, and persisted blocks are never treated as fresh network
+         * proof without being parsed and validated again.
+         */
+        val proofOfWorkHash: ByteArray = hash,
+        val auxPow: Boolean = false,
+        val auxPowValidated: Boolean = false,
+)
 
 open class FullTransaction(
     val header: Transaction,
@@ -32,6 +42,17 @@ open class FullTransaction(
     lateinit var metadata: TransactionMetadata
 
     init {
+        if (inputs.size == 1 &&
+            inputs[0].previousOutputIndex == 0xffffffffL &&
+            inputs[0].previousOutputTxHash.size == 32 &&
+            inputs[0].previousOutputTxHash.all { it == 0.toByte() }
+        ) {
+            // Persist this on the transaction. TransactionInput's historical
+            // primary key does not include the child transaction hash, so
+            // coinbase inputs can collide and must not be the later source of
+            // truth for maturity checks.
+            header.isCoinbase = true
+        }
         if (forceHashUpdate) {
             setHash(HashUtils.doubleSha256(TransactionSerializer.serialize(this, withWitness = false)))
         }
@@ -146,4 +167,3 @@ class FullTransactionInfo(
         }
 
 }
-

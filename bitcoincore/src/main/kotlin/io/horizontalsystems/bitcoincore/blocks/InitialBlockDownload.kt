@@ -6,6 +6,7 @@ import io.horizontalsystems.bitcoincore.models.InventoryItem
 import io.horizontalsystems.bitcoincore.models.MerkleBlock
 import io.horizontalsystems.bitcoincore.network.peer.Peer
 import io.horizontalsystems.bitcoincore.network.peer.PeerManager
+import io.horizontalsystems.bitcoincore.network.peer.VerifiedSyncHeightPolicy
 import io.horizontalsystems.bitcoincore.network.peer.task.GetBlockHashesTask
 import io.horizontalsystems.bitcoincore.network.peer.task.GetMerkleBlocksTask
 import io.horizontalsystems.bitcoincore.network.peer.task.PeerTask
@@ -17,8 +18,11 @@ import kotlin.math.max
 class InitialBlockDownload(
     private var blockSyncer: BlockSyncer,
     private val peerManager: PeerManager,
-    private val merkleBlockExtractor: MerkleBlockExtractor
+    private val merkleBlockExtractor: MerkleBlockExtractor,
+    minimumVerifiedBlockHeight: Int = 0,
 ) : IInitialDownload, GetMerkleBlocksTask.MerkleBlockHandler {
+
+    private val verifiedSyncHeightPolicy = VerifiedSyncHeightPolicy(minimumVerifiedBlockHeight)
 
     override var listener: IBlockSyncListener? = null
     override val syncedPeers = CopyOnWriteArrayList<Peer>()
@@ -155,7 +159,10 @@ class InitialBlockDownload(
 
             val blockHashes = blockSyncer.getBlockHashes(limit = 500)
             if (blockHashes.isEmpty()) {
-                peer.synced = peer.blockHashesSynced
+                peer.synced = peer.blockHashesSynced && verifiedSyncHeightPolicy.canFinish(
+                    peer.announcedLastBlockHeight,
+                    blockSyncer.localDownloadedBestBlockHeight,
+                )
             } else {
                 peer.addTask(GetMerkleBlocksTask(blockHashes, this, merkleBlockExtractor, minMerkleBlocks, minTransactions, minReceiveBytes))
             }
@@ -178,7 +185,12 @@ class InitialBlockDownload(
                 // Some peers fail to send InventoryMessage within expected time
                 // and become 'synced' in InitialBlockDownload without sending all of their blocks.
                 // In such case, we assume not all blocks are downloaded
-                if (blockSyncer.localDownloadedBestBlockHeight >= peer.announcedLastBlockHeight) {
+                if (
+                    verifiedSyncHeightPolicy.canFinish(
+                        peer.announcedLastBlockHeight,
+                        blockSyncer.localDownloadedBestBlockHeight,
+                    )
+                ) {
                     listener?.onBlockSyncFinished()
                 }
             }

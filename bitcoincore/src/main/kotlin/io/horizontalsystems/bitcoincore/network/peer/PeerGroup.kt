@@ -24,7 +24,8 @@ class PeerGroup(
     private val networkMessageSerializer: NetworkMessageSerializer,
     private val connectionManager: IConnectionManager,
     private val localDownloadedBestBlockHeight: Int,
-    private val handleAddrMessage: Boolean
+    private val handleAddrMessage: Boolean,
+    private val minimumVerifiedBlockHeight: Int = 0,
 ) : Peer.Listener, IPeerAddressManagerListener {
 
     interface Listener {
@@ -185,7 +186,15 @@ class PeerGroup(
 
         for (i in peerManager.peersCount until peerCountToHold) {
             val ip = hostManager.getIp() ?: break
-            val peer = Peer(ip, network, this, networkMessageParser, networkMessageSerializer, executorService)
+            val peer = Peer(
+                ip,
+                network,
+                this,
+                networkMessageParser,
+                networkMessageSerializer,
+                executorService,
+                minimumVerifiedBlockHeight,
+            )
             peerCountConnected += 1
             peerGroupListeners.forEach { it.onPeerCreate(peer) }
             peerManager.add(peer)
